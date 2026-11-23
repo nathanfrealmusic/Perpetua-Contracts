@@ -366,3 +366,6 @@ impl StreamNft {
         clear_executing(&env);
     }
 }
+
+#[cfg(test)]
+mod test;
