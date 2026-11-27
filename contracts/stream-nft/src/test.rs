@@ -1,3 +1,4 @@
+//! Invariant assertions, re-entrancy protection, and property tests for stream-nft.
 #![cfg(test)]
 
 use crate::{is_forbidden_address, is_zero_address, Config, Error, StreamNft, StreamNftClient};

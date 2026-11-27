@@ -1,5 +1,5 @@
 #![no_std]
-//! # Perpetua stream-NFT — represent stream recipient claims as tokens (#123, #367)
+//! # Perpetua stream-NFT — represent stream recipient claims as tokens (#123, #367, #370)
 //!
 //! Thin non-fungible wrapper over a single Perpetua stream instance. A stream
 //! that was created with `transferable = true` can be minted into an NFT keyed
@@ -24,6 +24,21 @@
 //!
 //! Admin rotation uses a secure two-step pattern (`propose_admin` / `accept_admin`)
 //! alongside direct rotation (`set_admin`), with burn address and self protection.
+//!
+//! ## Invariant Assertions and Re-entrancy Protection (#370)
+//!
+//! To prevent state desync and cross-contract re-entrancy during external calls
+//! into `FluxoraStream::transfer_recipient`, `StreamNft` enforces:
+//! 1. **Re-entrancy Guard**: Instance-level lock (`DataKey::Executing`) preventing
+//!    nested or re-entrant invocations of state-modifying operations.
+//! 2. **Check-Effects-Interactions (CEI)**: State is updated or guarded before
+//!    external invocations, and rollbacks on failure are strictly transactional.
+//! 3. **Checked Arithmetic**: All balance and supply updates use checked operations
+//!    (`checked_add`, `checked_sub`) panicking with explicit errors on overflow.
+//! 4. **Self-Transfer & Repeated-Transfer Guard**: Rejecting transfers where `from == to`
+//!    to prevent balance corruption and redundant external calls.
+//! 5. **Invariant In-Flight Assertions**: Verifying non-zero supply bounds,
+//!    non-underflowing balances, and ledger footprint cleanup.
 
 #[cfg(all(target_family = "wasm", not(target_os = "none")))]
 compile_error!("stream-NFT production WASM must be built for wasm32v1-none.");
@@ -31,9 +46,11 @@ compile_error!("stream-NFT production WASM must be built for wasm32v1-none.");
 #[cfg(test)]
 extern crate std;
 
+pub mod invariants;
+
 use soroban_sdk::{
-    contract, contractimpl, contracttype, panic_with_error, Address, Env, IntoVal, String, Symbol,
-    Val,
+    contract, contracterror, contractimpl, contracttype, panic_with_error, Address, Env, IntoVal,
+    String, Symbol, Val,
 };
 
 /// NFT metadata, underlying stream, and granular administrative roles.
@@ -69,11 +86,13 @@ pub enum DataKey {
     Balance(Address) = 2,
     /// Number of distinct tokens minted.
     Supply = 3,
+    /// Re-entrancy guard flag: set while state-modifying external operations are active.
+    Executing = 4,
     /// Nominated successor admin awaiting acceptance.
-    PendingAdmin = 4,
+    PendingAdmin = 5,
 }
 
-#[contracttype]
+#[contracterror]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Error {
     AlreadyInitialized = 1,
@@ -82,11 +101,15 @@ pub enum Error {
     TokenNotFound = 4,
     NotOwner = 5,
     StreamRejected = 6,
-    Unauthorized = 7,
-    UnauthorizedRole = 8,
-    InvalidRoleAddress = 9,
-    NoPendingAdmin = 10,
-    MintPaused = 11,
+    ReentrancyGuard = 7,
+    InvariantViolation = 8,
+    Overflow = 9,
+    RepeatedTransfer = 10,
+    Unauthorized = 11,
+    UnauthorizedRole = 12,
+    InvalidRoleAddress = 13,
+    NoPendingAdmin = 14,
+    MintPaused = 15,
 }
 
 #[contracttype]
@@ -162,11 +185,26 @@ fn set_config(env: &Env, config: &Config) {
 fn bump(env: &Env, key: &DataKey) {
     let live = env.storage().max_ttl();
     match key {
-        DataKey::Config | DataKey::Supply | DataKey::PendingAdmin => {
+        DataKey::Config | DataKey::Supply | DataKey::Executing | DataKey::PendingAdmin => {
             env.storage().instance().extend_ttl(live, live);
         }
         _ => env.storage().persistent().extend_ttl(key, live, live),
     }
+}
+
+fn is_executing(env: &Env) -> bool {
+    env.storage()
+        .instance()
+        .get(&DataKey::Executing)
+        .unwrap_or(false)
+}
+
+fn set_executing(env: &Env) {
+    env.storage().instance().set(&DataKey::Executing, &true);
+}
+
+fn clear_executing(env: &Env) {
+    env.storage().instance().remove(&DataKey::Executing);
 }
 
 /// Invoke `FluxoraStream::transfer_recipient(stream_id, to)`, panicking with
@@ -231,7 +269,7 @@ impl StreamNft {
         let caller = env.caller();
         caller.require_auth();
         Self::initialize(
-            env,
+            env.clone(),
             caller.clone(),
             caller.clone(),
             caller,
@@ -239,6 +277,8 @@ impl StreamNft {
             name,
             symbol,
         );
+        env.storage().instance().set(&DataKey::Supply, &0u64);
+        bump(&env, &DataKey::Supply);
     }
 
     // -------------------------------------------------------------------------
@@ -319,21 +359,33 @@ impl StreamNft {
 
     /// Tokenize a stream claim for the caller.
     pub fn mint(env: Env, stream_id: u64) {
+        if is_executing(&env) {
+            panic_with_error!(&env, Error::ReentrancyGuard);
+        }
+        set_executing(&env);
+
         let caller = env.caller();
         caller.require_auth();
 
         let config = get_config(&env);
         if config.mint_paused {
+            clear_executing(&env);
             panic_with_error!(&env, Error::MintPaused);
         }
 
         if env.storage().persistent().has(&DataKey::Owner(stream_id)) {
+            clear_executing(&env);
             panic_with_error!(&env, Error::AlreadyMinted);
         }
-        let supply = env.storage().instance().get(&DataKey::Supply).unwrap_or(0);
-        let new_supply = supply
-            .checked_add(1)
-            .unwrap_or_else(|| panic_with_error!(&env, Error::TokenNotFound));
+
+        let supply: u64 = env.storage().instance().get(&DataKey::Supply).unwrap_or(0);
+        let new_supply = match supply.checked_add(1) {
+            Some(s) => s,
+            None => {
+                clear_executing(&env);
+                panic_with_error!(&env, Error::Overflow);
+            }
+        };
 
         env.storage()
             .persistent()
@@ -345,48 +397,59 @@ impl StreamNft {
             .persistent()
             .get(&DataKey::Balance(caller.clone()))
             .unwrap_or(0);
-        let new_balance = balance
-            .checked_add(1)
-            .unwrap_or_else(|| panic_with_error!(&env, Error::TokenNotFound));
+        let new_balance = match balance.checked_add(1) {
+            Some(b) => b,
+            None => {
+                clear_executing(&env);
+                panic_with_error!(&env, Error::Overflow);
+            }
+        };
 
         env.storage()
             .persistent()
             .set(&DataKey::Balance(caller.clone()), &new_balance);
         bump(&env, &DataKey::Balance(caller));
-        env.storage().instance().set(&DataKey::Supply, &new_supply);
+
+        env.storage()
+            .instance()
+            .set(&DataKey::Supply, &new_supply);
+        bump(&env, &DataKey::Supply);
+
+        clear_executing(&env);
     }
 
     /// Transfer the claim token for `stream_id`, and reassign the underlying
     /// stream to `to`.
     pub fn transfer(env: Env, stream_id: u64, to: Address) {
+        if is_executing(&env) {
+            panic_with_error!(&env, Error::ReentrancyGuard);
+        }
+        set_executing(&env);
+
         let config = get_config(&env);
         let from = match env.storage().persistent().get(&DataKey::Owner(stream_id)) {
             Some(o) => o,
-            None => panic_with_error!(&env, Error::TokenNotFound),
+            None => {
+                clear_executing(&env);
+                panic_with_error!(&env, Error::TokenNotFound);
+            }
         };
-        from.require_auth();
 
         if from == to {
-            return;
+            clear_executing(&env);
+            panic_with_error!(&env, Error::RepeatedTransfer);
         }
 
-        transfer_claim(&env, &config, stream_id, &to);
+        from.require_auth();
 
         let from_balance: u32 = env
             .storage()
             .persistent()
             .get(&DataKey::Balance(from.clone()))
             .unwrap_or(0);
-        if from_balance == 1 {
-            env.storage().persistent().remove(&DataKey::Balance(from));
-        } else if from_balance > 1 {
-            let decremented = from_balance
-                .checked_sub(1)
-                .unwrap_or_else(|| panic_with_error!(&env, Error::TokenNotFound));
-            env.storage()
-                .persistent()
-                .set(&DataKey::Balance(from.clone()), &decremented);
-            bump(&env, &DataKey::Balance(from));
+        if from_balance == 0 {
+            clear_executing(&env);
+            panic_with_error!(&env, Error::InvariantViolation);
         }
 
         let to_balance: u32 = env
@@ -394,13 +457,48 @@ impl StreamNft {
             .persistent()
             .get(&DataKey::Balance(to.clone()))
             .unwrap_or(0);
-        let to_incremented = to_balance
-            .checked_add(1)
-            .unwrap_or_else(|| panic_with_error!(&env, Error::TokenNotFound));
+        let new_to_balance = match to_balance.checked_add(1) {
+            Some(b) => b,
+            None => {
+                clear_executing(&env);
+                panic_with_error!(&env, Error::Overflow);
+            }
+        };
+
+        // Call out to external stream contract. If it fails, Soroban unwinds host state.
+        transfer_claim(&env, &config, stream_id, &to);
+
+        // Update ownership
         env.storage()
             .persistent()
-            .set(&DataKey::Balance(to.clone()), &to_incremented);
+            .set(&DataKey::Owner(stream_id), &to);
+        bump(&env, &DataKey::Owner(stream_id));
+
+        // Update from balance
+        let new_from_balance = match from_balance.checked_sub(1) {
+            Some(b) => b,
+            None => {
+                clear_executing(&env);
+                panic_with_error!(&env, Error::InvariantViolation);
+            }
+        };
+
+        if new_from_balance == 0 {
+            env.storage().persistent().remove(&DataKey::Balance(from));
+        } else {
+            env.storage()
+                .persistent()
+                .set(&DataKey::Balance(from.clone()), &new_from_balance);
+            bump(&env, &DataKey::Balance(from));
+        }
+
+        // Update to balance
+        env.storage()
+            .persistent()
+            .set(&DataKey::Balance(to.clone()), &new_to_balance);
         bump(&env, &DataKey::Balance(to));
+
+        clear_executing(&env);
     }
 
     // -------------------------------------------------------------------------
